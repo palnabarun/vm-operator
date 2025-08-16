@@ -152,6 +152,25 @@ func FindSnapshot(
 	}
 }
 
+func CheckIfSnapshotRevertPossible(
+	vmCtx pkgctx.VirtualMachineContext,
+	vcVM *object.VirtualMachine,
+	snapObj *types.ManagedObjectReference) error {
+
+	// shouldn't be a case at this point, but good to check
+	if snapObj == nil {
+		return fmt.Errorf("snapshot is nil: %w", ErrSnapshotNotFound)
+	}
+
+	// if vmCtx.MoVM.Snapshot == nil || len(vmCtx.MoVM.Snapshot.RootSnapshotList) == 0 {
+	// 	return fmt.Errorf("no snapshots found for VM %s: %w", vmCtx.VM.Name, ErrNoSnapshots)
+	// }
+
+	// return nil
+
+	return errors.New("not implemented yet: CheckSnapshotRevertPossible")
+}
+
 // snapshotMap is a custom type that traverses over the entire snapshot tree.
 type snapshotMap map[string][]vimtypes.ManagedObjectReference
 

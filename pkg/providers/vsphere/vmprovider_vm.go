@@ -1307,6 +1307,32 @@ func (vs *vSphereVMProvider) reconcileSnapshotRevert(
 		return false, nil
 	}
 
+	// Check if the snapshot revert is actually possible.
+	// vpxd fails the snapshort revert if there's a CSI VolumeSnapshot for any PVCs attached to the VM
+	// between the current running state and the desired snapshot.
+	//
+	// - Find the snapshots for the VMs between the current state and the desired snapshot.
+	// - For each snapshot, check if there are any PVCs that have a VolumeSnapshot
+	// - If there are, we cannot revert to the desired snapshot.
+	if err := virtualmachine.CheckIfSnapshotRevertPossible(vmCtx, vcVM, snapObj); err != nil {
+		vmCtx.Logger.Error(err, "Snapshot revert is not possible",
+			"snapshotName", desiredSnapshotName,
+			"currentSnapshot", vmCtx.MoVM.Snapshot.CurrentSnapshot.Value,
+			"desiredSnapshot", snapObj.Reference().Value)
+	}
+
+	// TODO(nabarun): Update the VM CR with an error condition
+	// indicating that the snapshot revert is not possible.
+	// This will help the user to understand why the snapshot revert
+	// is not happening.
+
+	// TODO(nabarun): Emit an event indicating that the snapshot revert
+	// is not possible. This will help the user to understand why the
+	// snapshot revert is not happening.
+
+	// 	return true, fmt.Errorf("snapshot revert is not possible: %w", err)
+	// }
+
 	vmCtx.Logger.Info("Starting snapshot revert operation",
 		"snapshotName", desiredSnapshotName,
 		"currentSnapshot", vmCtx.MoVM.Snapshot.CurrentSnapshot.Value,
