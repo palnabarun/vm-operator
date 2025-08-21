@@ -192,6 +192,39 @@ func (r *Reconciler) ReconcileNormal(ctx *pkgctx.VirtualMachineSnapshotContext) 
 		return ctrl.Result{}, errors.New("VM hasn't been created and has no uniqueID")
 	}
 
+	// Set the snapshot's parent in the status.
+	ctx.Logger.V(4).Info("Updating snapshot's status parent")
+	parent, err := r.VMProvider.GetParentSnapshot(ctx.Context, vmSnapshot.Name, vm)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get parent snapshot: %w", err)
+	}
+
+	if parent != nil {
+		parentVMSnapshotCR := &vmopv1.VirtualMachineSnapshot{}
+		err := r.Get(ctx, client.ObjectKey{Name: parent.Name, Namespace: vmSnapshot.Namespace}, parentVMSnapshotCR)
+
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				// If the error is anything other than NotFound, return an error.
+				return ctrl.Result{}, fmt.Errorf("failed to get parent snapshot CR %s: %w", parent.Name, err)
+			} else {
+				// If the parent snapshot CR is not found, set the parent to an external reference.
+				// The snapshot might have been created in the backing infrastructure (vC) directly.
+				ctx.Logger.V(5).Info("Parent snapshot CR not found, setting parent to an external reference")
+
+				vmSnapshot.Status.Parent = &vmopv1common.LocalObjectRef{
+					APIVersion: vmopv1.GroupVersion.String(),
+					Kind:       vmopv1.VirtualMachineSnapshotKindExternal,
+					Name:       parent.Name,
+				}
+			}
+		} else {
+			ctx.Logger.V(5).Info("Found parent snapshot CR", "parent", parentVMSnapshotCR.Name)
+			// If the parent snapshot CR is found, set the parent in the status.
+			vmSnapshot.Status.Parent = vmSnapshotCRToLocalObjectRef(parentVMSnapshotCR)
+		}
+	}
+
 	// Calculate the requested capacity of the snapshot at the beginning only once.
 	if vmSnapshot.Status.Storage == nil {
 		vmSnapshot.Status.Storage = &vmopv1.VirtualMachineSnapshotStorageStatus{}
@@ -274,6 +307,13 @@ func (r *Reconciler) ReconcileDelete(ctx *pkgctx.VirtualMachineSnapshotContext) 
 	if err != nil {
 		return err
 	}
+
+	// Fetch and update all the children snapshots of the current snapshot.
+	// This is needed to ensure that the children snapshots are updated with the parent snapshot.
+	// ctx.Logger.V(4).Info("Updating children snapshots")
+	// if err := r.updateChildrenSnapshot(ctx); err != nil {
+	// 	return err
+	// }
 
 	if err := r.updateVMStatus(ctx, parent); err != nil {
 		return err

@@ -3014,9 +3014,10 @@ var _ = Describe("Snapshot status", func() {
 					Expect(ctx.Client.Delete(ctx, vmSnapshot)).To(Succeed())
 				})
 
-				It("should clear the root snapshots status", func() {
+				It("should set the root snapshot to an external ref", func() {
 					Expect(vmlifecycle.ReconcileStatus(vmCtx, ctx.Client, vcVM, data)).To(Succeed())
-					Expect(vmCtx.VM.Status.RootSnapshots).To(BeNil())
+					Expect(vmCtx.VM.Status.RootSnapshots).To(ContainElement(HaveField("Name", vmSnapshot.Name)))
+					Expect(vmCtx.VM.Status.RootSnapshots).To(ContainElement(HaveField("Kind", vmopv1.VirtualMachineSnapshotKindExternal)))
 				})
 			})
 

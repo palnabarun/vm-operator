@@ -1235,10 +1235,15 @@ func updateCurrentSnapshotStatus(
 				"snapshotName", snapshotName)
 			return err
 		}
-		// Snapshot custom resource doesn't exist, clear the status.
-		vmCtx.Logger.V(4).Info("VirtualMachineSnapshot custom resource not found, clearing status",
+		// Snapshot custom resource doesn't exist, set the status.currentSnapshot to an external ref.
+		vmCtx.Logger.V(4).Info(
+			"VirtualMachineSnapshot custom resource not found, setting to an external snapshot reference",
 			"snapshotName", snapshotName)
-		vm.Status.CurrentSnapshot = nil
+		vm.Status.CurrentSnapshot = &common.LocalObjectRef{
+			APIVersion: vmopv1.GroupVersion.String(),
+			Kind:       vmopv1.VirtualMachineSnapshotKindExternal,
+			Name:       snapshotName,
+		}
 
 		return nil
 	}
@@ -1314,6 +1319,8 @@ func updateRootSnapshots(vmCtx pkgctx.VirtualMachineContext, k8sClient ctrlclien
 			Namespace: vm.Namespace,
 		}
 
+		snapshotRef := common.LocalObjectRef{}
+
 		rootSnapshotCR := &vmopv1.VirtualMachineSnapshot{}
 		if err := k8sClient.Get(vmCtx, objKey, rootSnapshotCR); err != nil {
 			if !apierrors.IsNotFound(err) {
@@ -1321,20 +1328,21 @@ func updateRootSnapshots(vmCtx pkgctx.VirtualMachineContext, k8sClient ctrlclien
 					"snapshotName", rootSnapshot.Name)
 				return err
 			}
-			// TODO (lubron) Snapshot custom resource doesn't exist, but the snapshot
-			// could be created by admin on the vSphere. We will reference these kind
-			// of snapshots in other way, like externally created snapshots, so the snapshot
-			// graph reflects the actual state of the VM in vSphere.
-			vmCtx.Logger.V(4).Info("VirtualMachineSnapshot custom resource not found, skipping",
+
+			vmCtx.Logger.V(4).Info(
+				"VirtualMachineSnapshot custom resource not found, setting to an external snapshot reference",
 				"snapshotName", rootSnapshot.Name)
-			continue
+
+			snapshotRef.APIVersion = vmopv1.GroupVersion.String()
+			snapshotRef.Kind = vmopv1.VirtualMachineSnapshotKindExternal
+			snapshotRef.Name = rootSnapshot.Name
+		} else {
+			snapshotRef.APIVersion = rootSnapshotCR.APIVersion
+			snapshotRef.Kind = rootSnapshotCR.Kind
+			snapshotRef.Name = rootSnapshotCR.Name
 		}
 
-		newRootSnapshots = append(newRootSnapshots, common.LocalObjectRef{
-			APIVersion: rootSnapshotCR.APIVersion,
-			Kind:       rootSnapshotCR.Kind,
-			Name:       rootSnapshotCR.Name,
-		})
+		newRootSnapshots = append(newRootSnapshots, snapshotRef)
 	}
 
 	vm.Status.RootSnapshots = newRootSnapshots

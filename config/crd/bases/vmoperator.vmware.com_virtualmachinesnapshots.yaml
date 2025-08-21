@@ -368,6 +368,16 @@ spec:
                 description: |-
                   Children represents the snapshots for which this snapshot is
                   the parent.
+
+                  If the children snapshots exist in SV, this field is set to the
+                  children snapshots' names with the Kind set to VirtualMachineSnapshot.
+
+                  If the children snapshots do not exist in SV but only exist in VC,
+                  this field is set to the children snapshots' moRefs with the
+                  Kind set to EXTERNAL.
+
+                  If there are no children, this field is empty.
+                  This field is not set if the snapshot is a root snapshot.
                 items:
                   description: |-
                     LocalObjectRef describes a reference to another object in the same
@@ -455,6 +465,43 @@ spec:
                   - type
                   type: object
                 type: array
+              parent:
+                description: |-
+                  Parent represents the parent snapshot of this snapshot.
+
+                  If this snapshot is the root snapshot, this field is empty.
+
+                  If the parent snapshot exists in SV, this field is set to the
+                  parent snapshot's name with the Kind set to VirtualMachineSnapshot.
+
+                  If the parent snapshot does not exist in SV but only exists in VC,
+                  this field is set to the parent snapshot's moRef with the
+                  Kind set to EXTERNAL.
+                properties:
+                  apiVersion:
+                    description: |-
+                      APIVersion defines the versioned schema of this representation of an
+                      object. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+                    type: string
+                  kind:
+                    description: |-
+                      Kind is a string value representing the REST resource this object
+                      represents.
+                      Servers may infer this from the endpoint the client submits requests to.
+                      Cannot be updated.
+                      In CamelCase.
+                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                    type: string
+                  name:
+                    description: |-
+                      Name refers to a unique resource in the current namespace.
+                      More info: http://kubernetes.io/docs/user-guide/identifiers#names
+                    type: string
+                required:
+                - apiVersion
+                - kind
+                - name
+                type: object
               powerState:
                 description: |-
                   PowerState represents the observed power state of the virtual

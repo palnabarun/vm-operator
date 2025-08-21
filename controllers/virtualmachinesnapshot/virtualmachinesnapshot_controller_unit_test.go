@@ -7,6 +7,7 @@ package virtualmachinesnapshot_test
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -309,6 +310,113 @@ func unitTestsReconcile() {
 					vmSnapshotObj := &vmopv1.VirtualMachineSnapshot{}
 					Expect(ctx.Client.Get(ctx, types.NamespacedName{Name: vmSnapshot.Name, Namespace: vmSnapshot.Namespace}, vmSnapshotObj)).To(Succeed())
 					Expect(vmSnapshotObj.Annotations[constants.CSIVSphereVolumeSyncAnnotationKey]).To(Equal(constants.CSIVSphereVolumeSyncAnnotationValueRequest))
+				})
+			})
+		})
+
+		When("fetching parent snapshot from vC", func() {
+			BeforeEach(func() {
+				skipReconcile = true
+
+				conditions.MarkTrue(vmSnapshot, vmopv1.VirtualMachineSnapshotReadyCondition)
+				initObjects = nil
+				initObjects = append(initObjects, vmSnapshot)
+
+				vm.Status.UniqueID = dummyVMUUID
+				initObjects = append(initObjects, vm)
+			})
+
+			It("returns success", func() {
+				_, err = reconciler.Reconcile(cource.WithContext(ctx), reconcile.Request{NamespacedName: vmSnapshotNamespacedKey})
+				Expect(err).ToNot(HaveOccurred())
+			})
+
+			When("VC returns an error", func() {
+				JustBeforeEach(func() {
+					fakeVMProvider.GetParentSnapshotFn = func(_ context.Context, _ string, _ *vmopv1.VirtualMachine) (*vimtypes.VirtualMachineSnapshotTree, error) {
+						return nil, fmt.Errorf("some random vC error")
+					}
+				})
+
+				It("returns error", func() {
+					_, err = reconciler.Reconcile(cource.WithContext(ctx), reconcile.Request{NamespacedName: vmSnapshotNamespacedKey})
+					Expect(err).To(HaveOccurred())
+					Expect(err.Error()).To(ContainSubstring("some random vC error"))
+				})
+			})
+
+			When("parent snapshot doesn't not exist in vC", func() {
+				JustBeforeEach(func() {
+					fakeVMProvider.GetParentSnapshotFn = func(_ context.Context, _ string, _ *vmopv1.VirtualMachine) (*vimtypes.VirtualMachineSnapshotTree, error) {
+						return nil, nil
+					}
+				})
+
+				It("returns success, and does not set the parent snapshot", func() {
+					_, err = reconciler.Reconcile(cource.WithContext(ctx), reconcile.Request{NamespacedName: vmSnapshotNamespacedKey})
+					Expect(err).ToNot(HaveOccurred())
+
+					vmSnapshotObj := &vmopv1.VirtualMachineSnapshot{}
+					Expect(ctx.Client.Get(ctx, types.NamespacedName{Name: vmSnapshot.Name, Namespace: vmSnapshot.Namespace}, vmSnapshotObj)).To(Succeed())
+					Expect(vmSnapshotObj.Status.Parent).To(BeNil())
+				})
+			})
+
+			When("parent snapshot exist in vC", func() {
+				var parentSnapshot *vmopv1.VirtualMachineSnapshot
+
+				BeforeEach(func() {
+					conditions.MarkTrue(vmSnapshot, vmopv1.VirtualMachineSnapshotReadyCondition)
+					initObjects = nil
+					initObjects = append(initObjects, vmSnapshot)
+
+					vm.Status.UniqueID = dummyVMUUID
+					initObjects = append(initObjects, vm)
+
+					parentSnapshot = builder.DummyVirtualMachineSnapshot(namespace, "parent-snap", vm.Name)
+				})
+
+				JustBeforeEach(func() {
+					fakeVMProvider.GetParentSnapshotFn = func(_ context.Context, _ string, _ *vmopv1.VirtualMachine) (*vimtypes.VirtualMachineSnapshotTree, error) {
+						return &vimtypes.VirtualMachineSnapshotTree{
+							Name: parentSnapshot.Name,
+						}, nil
+					}
+				})
+
+				When("parent snapshot is a CR", func() {
+					BeforeEach(func() {
+						initObjects = append(initObjects, parentSnapshot)
+					})
+
+					It("returns success, and set's the parent snapshot to a CR ref", func() {
+						_, err = reconciler.Reconcile(cource.WithContext(ctx), reconcile.Request{NamespacedName: vmSnapshotNamespacedKey})
+						Expect(err).ToNot(HaveOccurred())
+
+						vmSnapshotObj := &vmopv1.VirtualMachineSnapshot{}
+						Expect(ctx.Client.Get(ctx, types.NamespacedName{Name: vmSnapshot.Name, Namespace: vmSnapshot.Namespace}, vmSnapshotObj)).To(Succeed())
+						Expect(vmSnapshotObj.Status.Parent).ToNot(BeNil())
+						Expect(vmSnapshotObj.Status.Parent).To(Equal(&vmopv1common.LocalObjectRef{
+							APIVersion: parentSnapshot.APIVersion,
+							Kind:       parentSnapshot.Kind,
+							Name:       parentSnapshot.Name,
+						}))
+					})
+				})
+
+				When("parent snapshot is not a CR", func() {
+					It("returns success, and set's the parent snapshot to an external ref", func() {
+						_, err = reconciler.Reconcile(cource.WithContext(ctx), reconcile.Request{NamespacedName: vmSnapshotNamespacedKey})
+						Expect(err).ToNot(HaveOccurred())
+
+						vmSnapshotObj := &vmopv1.VirtualMachineSnapshot{}
+						Expect(ctx.Client.Get(ctx, types.NamespacedName{Name: vmSnapshot.Name, Namespace: vmSnapshot.Namespace}, vmSnapshotObj)).To(Succeed())
+						Expect(vmSnapshotObj.Status.Parent).ToNot(BeNil())
+						Expect(vmSnapshotObj.Status.Parent).To(Equal(&vmopv1common.LocalObjectRef{
+							Kind: vmopv1.VirtualMachineSnapshotKindExternal,
+							Name: parentSnapshot.Name,
+						}))
+					})
 				})
 			})
 		})

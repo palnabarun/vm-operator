@@ -72,6 +72,14 @@ const (
 	VirtualMachineSnapshotInProgressReason = "VirtualMachineSnapshotInProgress"
 )
 
+const (
+	// VirtualMachineSnapshotKindExternal represents that the
+	// VirtualMachineSnapshot is an external snapshot that exists in
+	// the backing infrastructure (e.g., vSphere) but not in the
+	// Supervisor Cluster.
+	VirtualMachineSnapshotKindExternal = "EXTERNAL"
+)
+
 // VirtualMachineSnapshotStatus defines the observed state of VirtualMachineSnapshot.
 type VirtualMachineSnapshotStatus struct {
 	// +optional
@@ -96,8 +104,32 @@ type VirtualMachineSnapshotStatus struct {
 
 	// +optional
 
+	// Parent represents the parent snapshot of this snapshot.
+	//
+	// If this snapshot is the root snapshot, this field is empty.
+	//
+	// If the parent snapshot exists in SV, this field is set to the
+	// parent snapshot's name with the Kind set to VirtualMachineSnapshot.
+	//
+	// If the parent snapshot does not exist in SV but only exists in VC,
+	// this field is set to the parent snapshot's moRef with the
+	// Kind set to EXTERNAL.
+	Parent *vmopv1common.LocalObjectRef `json:"parent,omitempty"`
+
+	// +optional
+
 	// Children represents the snapshots for which this snapshot is
 	// the parent.
+	//
+	// If the children snapshots exist in SV, this field is set to the
+	// children snapshots' names with the Kind set to VirtualMachineSnapshot.
+	//
+	// If the children snapshots do not exist in SV but only exist in VC,
+	// this field is set to the children snapshots' moRefs with the
+	// Kind set to EXTERNAL.
+	//
+	// If there are no children, this field is empty.
+	// This field is not set if the snapshot is a root snapshot.
 	Children []vmopv1common.LocalObjectRef `json:"children,omitempty"`
 
 	// +optional
