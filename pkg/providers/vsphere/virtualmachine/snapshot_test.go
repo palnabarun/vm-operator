@@ -13,6 +13,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/mo"
@@ -604,6 +605,458 @@ func snapShotTests() {
 				childSnapshot.Name = ""
 				parent := virtualmachine.GetParentSnapshot(vmCtx, childSnapshot.Name)
 				Expect(parent).To(BeNil())
+			})
+		})
+	})
+
+	Describe("findSnapshotsBetween", func() {
+		var (
+			vmCtx      pkgctx.VirtualMachineContext
+			moVM       mo.VirtualMachine
+			rootSnap   vimtypes.ManagedObjectReference
+			childSnap1 vimtypes.ManagedObjectReference
+			childSnap2 vimtypes.ManagedObjectReference
+			childSnap3 vimtypes.ManagedObjectReference
+			branchSnap vimtypes.ManagedObjectReference
+		)
+
+		BeforeEach(func() {
+			vm := builder.DummyVirtualMachine()
+			vmCtx = pkgctx.VirtualMachineContext{
+				Context: ctx,
+				Logger:  logr.Discard(),
+				VM:      vm,
+			}
+
+			// Create snapshot references
+			rootSnap = vimtypes.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: "snap-root"}
+			childSnap1 = vimtypes.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: "snap-child1"}
+			childSnap2 = vimtypes.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: "snap-child2"}
+			childSnap3 = vimtypes.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: "snap-child3"}
+			branchSnap = vimtypes.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: "snap-branch"}
+		})
+
+		setupSnapshotTree := func(includeBranch bool) {
+			// Create base tree: root -> child1 -> child2 -> child3
+			rootTree := vimtypes.VirtualMachineSnapshotTree{
+				Name:     "root-snapshot",
+				Snapshot: rootSnap,
+				ChildSnapshotList: []vimtypes.VirtualMachineSnapshotTree{
+					{
+						Name:     "child1-snapshot",
+						Snapshot: childSnap1,
+						ChildSnapshotList: []vimtypes.VirtualMachineSnapshotTree{
+							{
+								Name:     "child2-snapshot",
+								Snapshot: childSnap2,
+								ChildSnapshotList: []vimtypes.VirtualMachineSnapshotTree{
+									{
+										Name:              "child3-snapshot",
+										Snapshot:          childSnap3,
+										ChildSnapshotList: []vimtypes.VirtualMachineSnapshotTree{},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			// Add branch if requested: root -> child1 -> child2 -> child3
+			//                              \-> branch
+			if includeBranch {
+				rootTree.ChildSnapshotList = append(rootTree.ChildSnapshotList,
+					vimtypes.VirtualMachineSnapshotTree{
+						Name:              "branch-snapshot",
+						Snapshot:          branchSnap,
+						ChildSnapshotList: []vimtypes.VirtualMachineSnapshotTree{},
+					})
+			}
+
+			moVM = mo.VirtualMachine{
+				Snapshot: &vimtypes.VirtualMachineSnapshotInfo{
+					CurrentSnapshot:  &childSnap3,
+					RootSnapshotList: []vimtypes.VirtualMachineSnapshotTree{rootTree},
+				},
+			}
+			vmCtx.MoVM = moVM
+		}
+
+		Context("with snapshot trees", func() {
+			DescribeTable("finding snapshots between current and target",
+				func(includeBranch bool, currentSnap, targetSnap *vimtypes.ManagedObjectReference, expectedCount int, expectedSnapshots []string) {
+					setupSnapshotTree(includeBranch)
+
+					// Override current snapshot if different
+					if currentSnap.Value != childSnap3.Value {
+						moVM.Snapshot.CurrentSnapshot = currentSnap
+						vmCtx.MoVM = moVM
+					}
+
+					snapshots, err := virtualmachine.FindSnapshotsBetween(vmCtx, currentSnap, targetSnap)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(snapshots).To(HaveLen(expectedCount))
+
+					// Check that returned snapshots match expected order
+					for i, expectedSnap := range expectedSnapshots {
+						Expect(snapshots[i].Value).To(Equal(expectedSnap))
+					}
+				},
+				Entry("linear: current to ancestor (child3 -> root)", false, &childSnap3, &rootSnap, 2, []string{"snap-child2", "snap-child1"}),
+				Entry("linear: current to immediate parent (child3 -> child2)", false, &childSnap3, &childSnap2, 0, []string{}),
+				Entry("linear: current to grandparent (child3 -> child1)", false, &childSnap3, &childSnap1, 1, []string{"snap-child2"}),
+				Entry("linear: current to itself (child3 -> child3)", false, &childSnap3, &childSnap3, 0, []string{}),
+				Entry("branched: main branch to different branch (child3 -> branch)", true, &childSnap3, &branchSnap, 2, []string{"snap-child2", "snap-child1"}),
+				Entry("branched: different branch to main (branch -> child3)", true, &branchSnap, &childSnap3, 0, []string{}),
+				Entry("branched: branch to common ancestor (branch -> root)", true, &branchSnap, &rootSnap, 0, []string{}),
+			)
+		})
+
+		Context("error cases", func() {
+			It("should return ErrNoSnapshots when VM has no snapshots", func() {
+				moVM = mo.VirtualMachine{Snapshot: nil}
+				vmCtx.MoVM = moVM
+
+				_, err := virtualmachine.FindSnapshotsBetween(vmCtx, &childSnap1, &rootSnap)
+				Expect(err).To(MatchError(virtualmachine.ErrNoSnapshots))
+			})
+
+			It("should return ErrNoSnapshots when VM has empty snapshot list", func() {
+				moVM = mo.VirtualMachine{
+					Snapshot: &vimtypes.VirtualMachineSnapshotInfo{
+						RootSnapshotList: []vimtypes.VirtualMachineSnapshotTree{},
+					},
+				}
+				vmCtx.MoVM = moVM
+
+				_, err := virtualmachine.FindSnapshotsBetween(vmCtx, &childSnap1, &rootSnap)
+				Expect(err).To(MatchError(virtualmachine.ErrNoSnapshots))
+			})
+
+			It("should return error when current snapshot not found", func() {
+				setupSnapshotTree(false)
+				invalidSnap := vimtypes.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: "invalid-current"}
+
+				_, err := virtualmachine.FindSnapshotsBetween(vmCtx, &invalidSnap, &rootSnap)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("current snapshot invalid-current not found"))
+			})
+
+			It("should return error when desired snapshot not found", func() {
+				setupSnapshotTree(false)
+				invalidSnap := vimtypes.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: "invalid-target"}
+
+				_, err := virtualmachine.FindSnapshotsBetween(vmCtx, &rootSnap, &invalidSnap)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("desired snapshot invalid-target not found"))
+			})
+
+			It("should return error when no common ancestor exists", func() {
+				// Create two separate root trees with no connection
+				disconnectedSnap := vimtypes.ManagedObjectReference{Type: "VirtualMachineSnapshot", Value: "disconnected"}
+				moVM = mo.VirtualMachine{
+					Snapshot: &vimtypes.VirtualMachineSnapshotInfo{
+						RootSnapshotList: []vimtypes.VirtualMachineSnapshotTree{
+							{Name: "root1", Snapshot: rootSnap, ChildSnapshotList: []vimtypes.VirtualMachineSnapshotTree{}},
+							{Name: "root2", Snapshot: disconnectedSnap, ChildSnapshotList: []vimtypes.VirtualMachineSnapshotTree{}},
+						},
+					},
+				}
+				vmCtx.MoVM = moVM
+
+				_, err := virtualmachine.FindSnapshotsBetween(vmCtx, &rootSnap, &disconnectedSnap)
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("no common ancestor found"))
+			})
+		})
+	})
+
+	Describe("HasVolumeSnapshots", func() {
+		var (
+			vmCtx      pkgctx.VirtualMachineContext
+			moVM       mo.VirtualMachine
+			vmSnapshot vimtypes.ManagedObjectReference
+			fcdKeys    sets.Set[int32]
+		)
+
+		BeforeEach(func() {
+			vm := builder.DummyVirtualMachine()
+			vmCtx = pkgctx.VirtualMachineContext{
+				Context: ctx,
+				Logger:  logr.Discard(),
+				VM:      vm,
+			}
+
+			vmSnapshot = vimtypes.ManagedObjectReference{
+				Type:  "VirtualMachineSnapshot",
+				Value: "snap-123",
+			}
+
+			fcdKeys = sets.New[int32]()
+		})
+
+		Context("when LayoutEx is nil", func() {
+			BeforeEach(func() {
+				moVM = mo.VirtualMachine{LayoutEx: nil}
+				vmCtx.MoVM = moVM
+			})
+
+			It("should return false", func() {
+				result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+				Expect(result).To(BeFalse())
+			})
+		})
+
+		Context("when LayoutEx exists", func() {
+			setupVMLayout := func(snapshotLayouts []vimtypes.VirtualMachineFileLayoutExSnapshotLayout) {
+				moVM = mo.VirtualMachine{
+					LayoutEx: &vimtypes.VirtualMachineFileLayoutEx{
+						Snapshot: snapshotLayouts,
+					},
+				}
+				vmCtx.MoVM = moVM
+			}
+
+			Context("with no snapshot layouts", func() {
+				BeforeEach(func() {
+					setupVMLayout([]vimtypes.VirtualMachineFileLayoutExSnapshotLayout{})
+				})
+
+				It("should return false", func() {
+					result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+					Expect(result).To(BeFalse())
+				})
+			})
+
+			Context("with snapshot layouts but no matching snapshot", func() {
+				BeforeEach(func() {
+					differentSnapshot := vimtypes.ManagedObjectReference{
+						Type:  "VirtualMachineSnapshot",
+						Value: "different-snap",
+					}
+					setupVMLayout([]vimtypes.VirtualMachineFileLayoutExSnapshotLayout{
+						{
+							Key: differentSnapshot,
+							Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+								{
+									Key: 100,
+									Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+										{FileKey: []int32{1, 2}},
+										{FileKey: []int32{3, 4}}, // Chain length > 1
+									},
+								},
+							},
+						},
+					})
+					fcdKeys.Insert(100)
+				})
+
+				It("should return false when snapshot not found", func() {
+					result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+					Expect(result).To(BeFalse())
+				})
+			})
+
+			Context("with matching snapshot", func() {
+				Context("and no FCD device keys", func() {
+					BeforeEach(func() {
+						setupVMLayout([]vimtypes.VirtualMachineFileLayoutExSnapshotLayout{
+							{
+								Key: vmSnapshot,
+								Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+									{
+										Key: 100,
+										Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+											{FileKey: []int32{1, 2}},
+											{FileKey: []int32{3, 4}}, // Chain length > 1
+										},
+									},
+								},
+							},
+						})
+						// fcdKeys is empty
+					})
+
+					It("should return false", func() {
+						result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+						Expect(result).To(BeFalse())
+					})
+				})
+
+				Context("with FCD device keys", func() {
+					BeforeEach(func() {
+						fcdKeys.Insert(100, 200)
+					})
+
+					Context("and no disk chains for FCDs", func() {
+						BeforeEach(func() {
+							setupVMLayout([]vimtypes.VirtualMachineFileLayoutExSnapshotLayout{
+								{
+									Key: vmSnapshot,
+									Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+										{
+											Key: 300, // Not an FCD
+											Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+												{FileKey: []int32{1, 2}},
+												{FileKey: []int32{3, 4}}, // Chain length > 1
+											},
+										},
+									},
+								},
+							})
+						})
+
+						It("should return false", func() {
+							result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+							Expect(result).To(BeFalse())
+						})
+					})
+
+					Context("with FCD disk having single chain", func() {
+						BeforeEach(func() {
+							setupVMLayout([]vimtypes.VirtualMachineFileLayoutExSnapshotLayout{
+								{
+									Key: vmSnapshot,
+									Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+										{
+											Key: 100, // FCD device key
+											Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+												{FileKey: []int32{1, 2}}, // Single chain
+											},
+										},
+									},
+								},
+							})
+						})
+
+						It("should return false", func() {
+							result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+							Expect(result).To(BeFalse())
+						})
+					})
+
+					Context("with FCD disk having multiple chains", func() {
+						BeforeEach(func() {
+							setupVMLayout([]vimtypes.VirtualMachineFileLayoutExSnapshotLayout{
+								{
+									Key: vmSnapshot,
+									Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+										{
+											Key: 100, // FCD device key
+											Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+												{FileKey: []int32{1, 2}},
+												{FileKey: []int32{3, 4}}, // Chain length > 1 indicates VolumeSnapshot
+											},
+										},
+									},
+								},
+							})
+						})
+
+						It("should return true", func() {
+							result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+							Expect(result).To(BeTrue())
+						})
+					})
+
+					Context("with mixed disk types", func() {
+						BeforeEach(func() {
+							setupVMLayout([]vimtypes.VirtualMachineFileLayoutExSnapshotLayout{
+								{
+									Key: vmSnapshot,
+									Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+										{
+											Key: 300, // Not an FCD
+											Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+												{FileKey: []int32{1, 2}},
+												{FileKey: []int32{3, 4}}, // Multiple chains but not FCD
+											},
+										},
+										{
+											Key: 100, // FCD with single chain
+											Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+												{FileKey: []int32{5, 6}},
+											},
+										},
+										{
+											Key: 200, // FCD with multiple chains
+											Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+												{FileKey: []int32{7, 8}},
+												{FileKey: []int32{9, 10}}, // This should trigger return true
+											},
+										},
+									},
+								},
+							})
+						})
+
+						It("should return true when at least one FCD has multiple chains", func() {
+							result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+							Expect(result).To(BeTrue())
+						})
+					})
+
+					Context("with empty chain for FCD", func() {
+						BeforeEach(func() {
+							setupVMLayout([]vimtypes.VirtualMachineFileLayoutExSnapshotLayout{
+								{
+									Key: vmSnapshot,
+									Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+										{
+											Key:   100,                                             // FCD device key
+											Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{}, // Empty chain
+										},
+									},
+								},
+							})
+						})
+
+						It("should return false", func() {
+							result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+							Expect(result).To(BeFalse())
+						})
+					})
+				})
+			})
+
+			Context("with multiple snapshots", func() {
+				BeforeEach(func() {
+					otherSnapshot := vimtypes.ManagedObjectReference{
+						Type:  "VirtualMachineSnapshot",
+						Value: "other-snap",
+					}
+					setupVMLayout([]vimtypes.VirtualMachineFileLayoutExSnapshotLayout{
+						{
+							Key: otherSnapshot,
+							Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+								{
+									Key: 100, // FCD with multiple chains in different snapshot
+									Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+										{FileKey: []int32{1, 2}},
+										{FileKey: []int32{3, 4}},
+									},
+								},
+							},
+						},
+						{
+							Key: vmSnapshot,
+							Disk: []vimtypes.VirtualMachineFileLayoutExDiskLayout{
+								{
+									Key: 100, // Same FCD but single chain in target snapshot
+									Chain: []vimtypes.VirtualMachineFileLayoutExDiskUnit{
+										{FileKey: []int32{5, 6}},
+									},
+								},
+							},
+						},
+					})
+					fcdKeys.Insert(100)
+				})
+
+				It("should only check the target snapshot", func() {
+					result := virtualmachine.HasVolumeSnapshots(vmCtx, &vmSnapshot, fcdKeys)
+					Expect(result).To(BeFalse()) // Target snapshot has single chain
+				})
 			})
 		})
 	})

@@ -152,23 +152,75 @@ func FindSnapshot(
 	}
 }
 
+// CheckIfSnapshotRevertPossible checks if it is possible to revert to a given snapshot.
+// It does this by checking the following:
+//   - if there are any FCDs (First Class Disks) attached to the VM.
+//   - if there are no FCDs, it is always possible to revert to a snapshot.
+//   - if there are FCDs, it checks if there are any VolumeSnapshots associated with those FCDs
+//     that were created at or after the given VM snapshot.
+//   - if there are VolumeSnapshots, it is not possible to revert to the desired snapshot.
+//   - if there are no VolumeSnapshots, it is possible to revert to the desired snapshot.
+//
+// The following function does the following:
+// - get the device keys of all FCDs attached to the VM.
+// - if no FCDs are attached, return true (revert is possible).
+// - if the desired snapshot is nil, return false (cannot revert). (It's a redundant check just for sanity)
+// - if the VM has no snapshots, return false (cannot revert).
+// - fetch the current snapshot of the VM.
+// - find all snapshots between the current snapshot and the desired snapshot.
+// - for each snapshot in that range, check if any FCDs have VolumeSnapshots.
+// - if any FCD has a VolumeSnapshot, return false (cannot revert).
+// - if no FCDs have VolumeSnapshots, return true (revert is possible).
+//
+// This function is used to determine if a snapshot revert operation can be performed without
+// encountering issues with existing VolumeSnapshots.
 func CheckIfSnapshotRevertPossible(
 	vmCtx pkgctx.VirtualMachineContext,
 	vcVM *object.VirtualMachine,
-	snapObj *types.ManagedObjectReference) error {
+	desiredSnapObj *vimtypes.ManagedObjectReference) (bool, error) {
 
 	// shouldn't be a case at this point, but good to check
-	if snapObj == nil {
-		return fmt.Errorf("snapshot is nil: %w", ErrSnapshotNotFound)
+	if desiredSnapObj == nil {
+		vmCtx.Logger.V(4).Info("snapshot is nil, cannot check revert possibility")
+		return false, nil
 	}
 
-	// if vmCtx.MoVM.Snapshot == nil || len(vmCtx.MoVM.Snapshot.RootSnapshotList) == 0 {
-	// 	return fmt.Errorf("no snapshots found for VM %s: %w", vmCtx.VM.Name, ErrNoSnapshots)
-	// }
+	// get FCDs (First Class Disks) attached to the VM
+	// if no PVC aka FCDs are attached, we can always revert to a snapshot
+	fcdDeviceKeys := getFCDDeviceKeySet(vmCtx)
+	if fcdDeviceKeys.Len() == 0 {
+		// no FCDs attached, no VolumeSnapshots to check. We are good to return early here.
+		return true, nil
+	}
 
-	// return nil
+	if vmCtx.MoVM.Snapshot == nil || len(vmCtx.MoVM.Snapshot.RootSnapshotList) == 0 {
+		vmCtx.Logger.V(4).Info("no snapshots found for VM, cannot check revert possibility")
+		return false, nil
+	}
 
-	return errors.New("not implemented yet: CheckSnapshotRevertPossible")
+	currentSnapshot := vmCtx.MoVM.Snapshot.CurrentSnapshot
+
+	// find snapshots between current and desired snapshot by traversing the snapshot tree
+	snapshotsBetween, err := FindSnapshotsBetween(vmCtx, currentSnapshot, desiredSnapObj)
+	if err != nil {
+		return false, fmt.Errorf("failed to find snapshots between current and desired: %w", err)
+	}
+
+	vmCtx.Logger.V(4).Info("checking for VolumeSnapshots between current and desired snapshot",
+		"currentSnapshot", currentSnapshot.Value,
+		"desiredSnapshot", desiredSnapObj.Value,
+		"snapshotsBetween", len(snapshotsBetween),
+		"fcdCount", fcdDeviceKeys.Len())
+
+	// for each snapshot between current and desired, check if any FCDs have VolumeSnapshots
+	for _, snapshot := range snapshotsBetween {
+		if HasVolumeSnapshots(vmCtx, snapshot, fcdDeviceKeys) {
+			return false, fmt.Errorf("cannot revert to snapshot %s: VolumeSnapshot exists for attached volume between current state and desired snapshot at %s",
+				desiredSnapObj.Value, snapshot.Value)
+		}
+	}
+
+	return true, nil
 }
 
 // snapshotMap is a custom type that traverses over the entire snapshot tree.
@@ -286,6 +338,141 @@ func getFCDDeviceKeySet(vmCtx pkgctx.VirtualMachineContext) sets.Set[int32] {
 	}
 
 	return deviceKeysSet
+}
+
+// buildSnapshotParentMap creates a mapping of snapshots to their parent snapshots
+// by traversing the snapshot tree recursively.
+func buildSnapshotParentMap(snapshots []vimtypes.VirtualMachineSnapshotTree) map[string]string {
+	parentMap := make(map[string]string) // child -> parent mapping
+
+	var build func(snapshots []vimtypes.VirtualMachineSnapshotTree, parent string)
+	build = func(snapshots []vimtypes.VirtualMachineSnapshotTree, parent string) {
+		for _, snapshot := range snapshots {
+			if parent != "" {
+				parentMap[snapshot.Snapshot.Value] = parent
+			}
+
+			build(snapshot.ChildSnapshotList, snapshot.Snapshot.Value)
+		}
+	}
+
+	build(snapshots, "")
+
+	return parentMap
+}
+
+// FindSnapshotsBetween finds all snapshots that exist between the current snapshot
+// and the desired snapshot in the snapshot tree. This function traverses the snapshot
+// tree to identify the path from the current snapshot to the desired snapshot.
+func FindSnapshotsBetween(vmCtx pkgctx.VirtualMachineContext, currentSnapshot, desiredSnapshot *vimtypes.ManagedObjectReference) ([]*vimtypes.ManagedObjectReference, error) {
+	if vmCtx.MoVM.Snapshot == nil || len(vmCtx.MoVM.Snapshot.RootSnapshotList) == 0 {
+		return nil, ErrNoSnapshots
+	}
+
+	// build the snapshot tree
+	snapshotMap := make(snapshotMap)
+	snapshotMap.add("", vmCtx.MoVM.Snapshot.RootSnapshotList)
+
+	// compute parent relationships
+	parentMap := buildSnapshotParentMap(vmCtx.MoVM.Snapshot.RootSnapshotList)
+
+	// check if both snapshots exist using the existing snapshotMap
+	// these are additional checks to ensure the current and desired snapshots are valid
+	if snapshots := snapshotMap[currentSnapshot.Value]; len(snapshots) == 0 {
+		return nil, fmt.Errorf("current snapshot %s not found in snapshot tree", currentSnapshot.Value)
+	}
+	if snapshots := snapshotMap[desiredSnapshot.Value]; len(snapshots) == 0 {
+		return nil, fmt.Errorf("desired snapshot %s not found in snapshot tree", desiredSnapshot.Value)
+	}
+
+	// find path from current snapshot to root iteratively
+	currentPath := make(map[string]bool)
+	current := currentSnapshot.Value
+	for current != "" {
+		currentPath[current] = true
+		current = parentMap[current]
+	}
+
+	// find path from desired snapshot to root and identify common ancestor
+	var commonAncestor string
+	desired := desiredSnapshot.Value
+	for desired != "" {
+		if currentPath[desired] {
+			// the desired snapshot is an ancestor of the current snapshot
+			commonAncestor = desired
+			break
+		}
+		desired = parentMap[desired]
+	}
+
+	if commonAncestor == "" {
+		return nil, fmt.Errorf("no common ancestor found between current and desired snapshots")
+	}
+
+	// collect all snapshots from current back to (but not including) the desired snapshot
+	var snapshotsBetween []*vimtypes.ManagedObjectReference
+
+	// if common ancestor is the same as desired snapshot, we are reverting to an ancestor
+	// so we collect all snapshots from current to desired TODO: (exclusive)
+	// otherwise, we are reverting to a different branch, which would involve snapshots being lost
+	if commonAncestor == desiredSnapshot.Value {
+		current := currentSnapshot.Value
+		for current != "" && current != desiredSnapshot.Value {
+			if current != currentSnapshot.Value { // Don't include the current snapshot itself
+				snapshots := snapshotMap[current]
+				if len(snapshots) > 0 {
+					snapshotsBetween = append(snapshotsBetween, &snapshots[0])
+				}
+			}
+			current = parentMap[current]
+		}
+	} else {
+		// TODO(nabarun): Verify if this still holds in VC and what is the behavior.
+		current := currentSnapshot.Value
+		for current != "" && current != commonAncestor {
+			if current != currentSnapshot.Value { // Don't include the current snapshot itself
+				snapshots := snapshotMap[current]
+				if len(snapshots) > 0 {
+					snapshotsBetween = append(snapshotsBetween, &snapshots[0])
+				}
+			}
+			current = parentMap[current]
+		}
+	}
+
+	return snapshotsBetween, nil
+}
+
+// HasVolumeSnapshots checks if there are any VolumeSnapshots associated with FCDs
+// that were created at or after the given VM snapshot. This is determined by checking
+// if the VM snapshot contains delta disks for any of the FCDs.
+func HasVolumeSnapshots(vmCtx pkgctx.VirtualMachineContext, vmSnapshot *vimtypes.ManagedObjectReference, fcdDeviceKeys sets.Set[int32]) bool {
+	if vmCtx.MoVM.LayoutEx == nil {
+		vmCtx.Logger.V(5).Info("vmCtx.MoVM.LayoutEx is nil, cannot check for VolumeSnapshots")
+		return false
+	}
+
+	// find the snapshot layout for the given snapshot
+	for _, snapshotLayout := range vmCtx.MoVM.LayoutEx.Snapshot {
+		if snapshotLayout.Key.Value == vmSnapshot.Value {
+			// check if this snapshot has any disk deltas for FCDs
+			for _, disk := range snapshotLayout.Disk {
+				if fcdDeviceKeys.Has(disk.Key) {
+					// if there are delta disks for FCDs in this snapshot,
+					// it indicates potential VolumeSnapshots exist
+					if len(disk.Chain) > 1 {
+						vmCtx.Logger.V(4).Info("Found delta disk chain for FCD in snapshot",
+							"snapshotId", vmSnapshot.Value,
+							"fcdDeviceKey", disk.Key,
+							"chainLength", len(disk.Chain))
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 // GetParentSnapshot finds the parent snapshot of a given snapshot name.
